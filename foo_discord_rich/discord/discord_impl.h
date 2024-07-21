@@ -21,6 +21,7 @@ public:
     DiscordRichPresence presence;
     metadb_handle_ptr metadb;
     std::u8string state;
+    int type = 2; // listening
     std::u8string details;
     std::u8string largeImageKey;
     std::u8string smallImageKey;

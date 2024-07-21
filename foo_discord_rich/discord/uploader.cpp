@@ -7,6 +7,7 @@
 #include <ctime>
 #include <fb2k/artwork_metadb.h>
 
+#include "discord_impl.h"
 #include "image_hasher.h"
 #include "foobar2000/SDK/component.h"
 
@@ -47,7 +48,7 @@ private:
 std::mutex upload_lock::lock_;
 
 threaded_process_artwork_uploader::threaded_process_artwork_uploader(
-    const pfc::map_t<metadb_index_hash, metadb_handle_ptr>& hashes) : hashes_(hashes)
+    const pfc::map_t<metadb_index_hash, metadb_handle_ptr>& hashes, const bool regenerate) : hashes_(hashes), regenerate_(regenerate)
 {}
 
 void threaded_process_artwork_uploader::on_init(ctx_t p_wnd) {}
@@ -64,7 +65,7 @@ void threaded_process_artwork_uploader::run(threaded_process_status &p_status, a
             p_status.set_progress_float( currIdx / (double)total_count );
             const auto kv = *iter;
             
-            if (record_get( kv.m_key ).artwork_url.get_length() > 0)
+            if (!regenerate_ && record_get( kv.m_key ).artwork_url.get_length() > 0)
             {
                 p_abort.check();
                 currIdx++;
@@ -73,7 +74,7 @@ void threaded_process_artwork_uploader::run(threaded_process_status &p_status, a
 
             pfc::string8 artwork_url;
 
-            if (extractAndUploadArtwork(kv.m_value, p_abort, artwork_url, kv.m_key))
+            if (extractAndUploadArtwork(kv.m_value, p_abort, artwork_url, kv.m_key, regenerate_))
             {
                 lstChanged += kv.m_key;
             }
@@ -96,6 +97,7 @@ void threaded_process_artwork_uploader::run(threaded_process_status &p_status, a
         fb2k::inMainThread([lstChanged]
         {
             cached_index_api()->dispatch_refresh(guid::artwork_url_index, lstChanged);
+            DiscordHandler::GetInstance().GetPresenceModifier().UpdateImage();
         });
     }
 }
@@ -104,7 +106,7 @@ void threaded_process_artwork_uploader::on_done(ctx_t p_wnd,bool p_was_aborted)
 {
 }
 
-bool extractAndUploadArtwork(const metadb_handle_ptr track, abort_callback &abort, pfc::string8 &artwork_url, metadb_index_hash hash)
+bool extractAndUploadArtwork(const metadb_handle_ptr track, abort_callback &abort, pfc::string8 &artwork_url, metadb_index_hash hash, const bool regenerate)
 {
     if ( config::uploadArtworkCommand.GetValue().length() == 0 )
     {
@@ -116,8 +118,9 @@ bool extractAndUploadArtwork(const metadb_handle_ptr track, abort_callback &abor
     upload_lock lock;
     abort.check();
 
-    // If we were locked check if this tracks artwork was uploaded and use that if it is found
-    if (wasLocked)
+    // If we were locked check if this tracks artwork was uploaded and use that if it is found.
+    // If the artwork url needs to be regenerated do not do this
+    if (wasLocked && !regenerate)
     {
         const auto rec = record_get( hash );
         if (rec.artwork_url.get_length() > 0)
@@ -251,8 +254,11 @@ bool readFromPipe(HANDLE g_hChildStd_OUT_Rd, pfc::string8 &artwork_url)
     const int TEMP_BUF_SIZE = 16;
     CHAR tempBuf[TEMP_BUF_SIZE];
     DWORD peekedBytes;
-    auto now = std::chrono::high_resolution_clock::now();
-    const auto timeout_s = std::chrono::seconds(10);
+    const auto now = std::chrono::high_resolution_clock::now();
+
+    // Read timeout from conf. If set to 0 use 1 day as timeout.
+    const long timeout_config = config::processTimeout.GetValue();
+    const auto timeout_s = std::chrono::seconds(timeout_config == 0 ? 86400 : timeout_config);
 
     // Try to read output from the process. for 10 seconds
     while (!inputFound)
@@ -267,7 +273,7 @@ bool readFromPipe(HANDLE g_hChildStd_OUT_Rd, pfc::string8 &artwork_url)
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        auto td = std::chrono::high_resolution_clock::now() - now;
+        const auto td = std::chrono::high_resolution_clock::now() - now;
         if (td > timeout_s) break;
     }
 
@@ -332,7 +338,7 @@ pfc::string8 getArtworkFilepath(const artwork_info& art, abort_callback &abort, 
         // Take the last 10 digits of current time and use that for filename.
         // Should be good enough for this purpose as the file is deleted after the operation or overwritten in the future
         const auto ts = std::to_string(std::time(NULL));
-        const auto filename = pfc::string8((ts.substr(std::max(ts.size(), 10u) - 10) + "." + ext).c_str());
+        const auto filename = pfc::string8((ts.substr(std::max(ts.size(), (size_t)10) - 10) + "." + ext).c_str());
 
         tempDir.add_filename(filename.c_str());
         filepath = tempDir;
@@ -372,7 +378,7 @@ std::wstring to_wstring(const std::string &str)
             CP_UTF8,
             0,
             str.c_str(),
-            str.length(),
+            (DWORD)str.length(),
             NULL,
             0);
 
@@ -392,7 +398,7 @@ std::wstring to_wstring(const std::string &str)
         CP_UTF8,
         0,
         str.c_str(),
-        str.length(),
+        (DWORD)str.length(),
         &str_w[0],
         (int)str_w.size() );
 
@@ -433,7 +439,7 @@ bool uploadOpenProcess(const std::wstring &cmd_w, const char* filepath_c, pfc::s
          try
          {
              DWORD dwWritten;
-             bool wSuccess = WriteFile(g_hChildStd_IN_Wr, filepath_c, strlen( filepath_c ), &dwWritten, NULL );
+             bool wSuccess = WriteFile(g_hChildStd_IN_Wr, filepath_c, (DWORD)strlen( filepath_c ), &dwWritten, NULL );
              CloseHandle( g_hChildStd_IN_Wr );
              g_hChildStd_IN_Wr = NULL;
 
@@ -454,19 +460,34 @@ bool uploadOpenProcess(const std::wstring &cmd_w, const char* filepath_c, pfc::s
 
          DWORD exit_code;
          GetExitCodeProcess( piProcInfo.hProcess, &exit_code );
+         bool terminateProcess = exit_code == STILL_ACTIVE && artwork_url.get_length() == 0;
+
+         // In case of a time out terminate the process
+         if (terminateProcess)
+         {
+             TerminateProcess(&piProcInfo.hProcess, exit_code);
+             WaitForSingleObject( piProcInfo.hProcess, 5000 );
+         }
+
          CloseHandle( piProcInfo.hProcess );
          CloseHandle( piProcInfo.hThread );
 
-         FB2K_console_formatter() << DRP_NAME_WITH_VERSION << ": artwork uploader exited with status: " << exit_code <<
-             " and " << ( exit_code == 0 ? "url" : "error" ) << ": " << artwork_url;
+         // If exit code is zero and result contains newlines assume it's an error since urls should not contains those
+         const bool isError = exit_code != 0 || artwork_url.find_first('\n') != ~0;
+         artwork_url =  terminateProcess ? pfc::string8("Process timed out") : artwork_url;
 
-         if (exit_code != 0)
+         FB2K_console_formatter() << DRP_NAME_WITH_VERSION << ": artwork uploader exited with status: " << exit_code <<
+             " and " << ( isError ? "error" : "url" ) << ": " << artwork_url;
+
+         if (isError)
          {
              artwork_url = "";
          }
 
          return true;
      }
+
+    FB2K_console_formatter() << DRP_NAME_WITH_VERSION << ": Failed to run command '" << cmd_w << "'";
 
     return false;
 }
@@ -523,10 +544,10 @@ pfc::string8 uploadArtwork(artwork_info& art, abort_callback &abort)
          PROCESS_INFORMATION piProcInfo; 
          ZeroMemory( &piProcInfo, sizeof(PROCESS_INFORMATION) );
 
-        #ifdef _DEBUG
-        FB2K_console_formatter() << DRP_NAME_WITH_VERSION << ": Upload command " << commandString;
-        FB2K_console_formatter() << DRP_NAME_WITH_VERSION << ": Cover file path " << filepath;
-        #endif
+         #ifdef _DEBUG
+         FB2K_console_formatter() << DRP_NAME_WITH_VERSION << ": Upload command " << commandString;
+         FB2K_console_formatter() << DRP_NAME_WITH_VERSION << ": Cover file path " << filepath;
+         #endif
          const auto cmd_w = to_wstring( commandString );
 
          abort.check();

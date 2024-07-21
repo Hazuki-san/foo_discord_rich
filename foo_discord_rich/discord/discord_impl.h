@@ -20,10 +20,10 @@ private:
 public:
     DiscordRichPresence presence;
     metadb_handle_ptr metadb;
-    std::u8string state;
-    std::u8string details;
-    std::u8string largeImageKey;
-    std::u8string smallImageKey;
+    qwr::u8string state;
+    qwr::u8string details;
+    qwr::u8string largeImageKey;
+    qwr::u8string smallImageKey;
     double trackLength = 0;
 };
 
@@ -42,7 +42,7 @@ class PresenceModifier
 public:
     ~PresenceModifier();
 
-    void UpdateImage();
+    void UpdateImage(const pfc::string8& url="");
     void UpdateSmallImage();
     void UpdateTrack( metadb_handle_ptr metadb = metadb_handle_ptr() );
     void UpdateDuration( double time );
@@ -92,7 +92,7 @@ private:
 
 private:
     bool hasPresence_ = true;
-    std::u8string appToken_;
+    qwr::u8string appToken_;
     std::shared_ptr<internal::PresenceData> presenceData_ = std::make_shared<internal::PresenceData>();
 };
 

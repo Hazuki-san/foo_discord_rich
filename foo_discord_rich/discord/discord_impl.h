@@ -20,10 +20,11 @@ private:
 public:
     DiscordRichPresence presence;
     metadb_handle_ptr metadb;
-    qwr::u8string state;
-    qwr::u8string details;
-    qwr::u8string largeImageKey;
-    qwr::u8string smallImageKey;
+    std::u8string state;
+    int type = 2; // listening
+    std::u8string details;
+    std::u8string largeImageKey;
+    std::u8string smallImageKey;
     double trackLength = 0;
 };
 
